@@ -1,3 +1,13 @@
-.env
+# Environment
 .venv/
-__pucache__/
+env/
+venv/
+ENV/
+
+# Secrets
+.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
