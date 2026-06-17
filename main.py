@@ -170,6 +170,15 @@ FEW_SHOT_EXAMPLES = {
         },
     ],
 }
+# metadata for token pricing
+TOKEN_PRICING = {
+    "gpt-4o-mini": {
+        "input": 0.15,  # $ per 1M input tokens
+        "output": 0.60,  # $ per 1M output tokens
+    },
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+}
+MODEL = "gpt-4o-mini"
 
 
 # pydantic
@@ -193,13 +202,24 @@ def build_initial_message(mode: str) -> list[dict]:
     return initial_messages
 
 
+# function to calaculate the cost of each request
+def calaculateTokensCost(inputTokens: int, outputTokens: int, model: str = MODEL):
+    pricing = TOKEN_PRICING.get(model, TOKEN_PRICING["gpt-4o-mini"])
+    inputCost = (inputTokens / 1000000) * pricing["input"]
+    outputCost = (outputTokens / 1000000) * pricing["output"]
+    return round(inputCost + outputCost, 8)
+
+
 # calling AI
 async def get_ai_response(messages, temp=0.7):
     try:
         response = await client.chat.completions.create(
             model="gpt-4o-mini", messages=messages, temperature=temp
         )
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        inputTokens = response.usage.prompt_tokens
+        outputTokens = response.usage.completion_tokens
+        return content, inputTokens, outputTokens
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI error: {str(e)}")
 
@@ -237,15 +257,30 @@ async def sendMessage(request: ChatRequest):
 
     chat_history[sessionId].append({"role": "user", "content": protected_content})
 
-    ai_response = await get_ai_response(chat_history[sessionId])
+    ai_response, inputTokens, outputTokens = await get_ai_response(
+        chat_history[sessionId]
+    )
 
-    chat_history[sessionId].append({"role": "assistant", "content": ai_response})
+    chat_history[sessionId].append(
+        {
+            "role": "assistant",
+            "content": ai_response,
+            "tokens": inputTokens + outputTokens,
+        }
+    )
+    cost = calaculateTokensCost(inputTokens, outputTokens)
 
     return {
         "session_id": sessionId,
         "mode": mode,
         "response": ai_response,
         "history_length": len(chat_history[sessionId]),
+        "token_stats": {
+            "input_tokens": inputTokens,
+            "output_tokens": outputTokens,
+            "total_tokens": inputTokens + outputTokens,
+            "estimated_cost_usd": cost,
+        },
     }
 
 
