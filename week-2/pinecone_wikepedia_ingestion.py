@@ -4,8 +4,6 @@ from pinecone import Pinecone, ServerlessSpec
 from openai import OpenAI
 import wikipedia
 import time
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
 load_dotenv()
 # set a user agent to bypass the wikepedia rate limiter  so that we can extract 50 articles
@@ -67,63 +65,6 @@ topics = [
     "Reinforcement learning",
 ]
 
-# Initialize FastAPI App instance
-app = FastAPI(title="Wikipedia Semantic Search Engine API")
-
-pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-index_name = "semantic-search-wiki"
-
-# check if the index already exisits in pinecode if not creates a index with the following metrics
-if not pc.has_index(index_name):
-    print(f"Initialising index deployement: {index_name}")
-    pc.create_index(
-        name=index_name,
-        dimension=1536,
-        metric="cosine",
-        spec=ServerlessSpec(
-            cloud="aws",  # Infrastructure host provider
-            region="us-east-1",  # Target region placement
-        ),
-    )
-    print(f"✅ Success! Index '{index_name}' created under Serverless AWS footprint.")
-else:
-    print(f"ℹ️ Index '{index_name}' already exists in your Pinecone project.")
-
-
-# connects your code to the Pinecone index named semantic-search-wiki.
-index = pc.Index("semantic-search-wiki")
-# describes the status of the index
-print(index.describe_index_stats())
-
-
-# fetching articles from wikepedia and accumilating it in articles =[]
-articles = []
-for topic in topics:
-    try:
-        page = wikipedia.page(
-            topic, auto_suggest=False
-        )  # auto_suggest is set to False because we do not want wikepedia to automatically alter the topic name while fetching articles
-        articles.append(
-            {
-                "title": page.title,
-                "content": page.content,
-                "url": page.url,
-                "pageid": page.pageid,
-            }
-        )
-        print(f"Loaded:{page.title}")
-        time.sleep(0.5)
-    except wikipedia.exceptions.DisambiguationError as e:
-        print(f"Disambiguation Error for '{topic}'. Options found: {e.options[:3]}")
-    except wikipedia.exceptions.PageError:
-        print(f"Page Error: '{topic}' does not exist on Wikipedia.")
-    except Exception as e:
-        print(f"Skipped '{topic}' due to an unexpected error: {e}")
-
-print(f"total articles loaded:{len(articles)}")
-
 
 # convert the article content to smaller chuncks
 def generate_overlapping_chuncks(raw_articles, chunck_size=200, overlap=50):
@@ -159,29 +100,6 @@ def generate_overlapping_chuncks(raw_articles, chunck_size=200, overlap=50):
         f"✅ Chunking Complete! Segmented 52 articles into {len(processed_chuncks)} individual dense text blocks."
     )
     return processed_chuncks
-
-
-# code to test if the chuncking and overlapping is actually working
-"""
-test_text = " ".join([f"word{i}" for i in range(500)])
-mock_articles = [
-    {
-        "pageid": "99999",
-        "title": "Unit Test Document",
-        "content": test_text,
-        "url": "http://localhost/test",
-    }
-]
-chunks = generate_overlapping_chuncks(mock_articles, chunck_size=200, overlap=50)
-print(f"Last 50 words of chunk 0: {chunks[0]['text'].split()[-50:]}")
-print(f"First 50 words of chunk 1: {chunks[1]['text'].split()[:50]}")
-"""
-chunks = generate_overlapping_chuncks(articles, chunck_size=200, overlap=50)
-
-print("\n==================================================")
-print("📊 PRODUCTION DATASET METRICS ANALYSIS")
-print("==================================================")
-print(f"Total Chunks Produced across 52 Articles: {len(chunks)}")
 
 
 # function to pass the chuncks in batches of 100 to openai for embedding and upserting the embeddings to pinecone.
@@ -243,4 +161,67 @@ def generate_embeddings_and_upsert(chunks, index, batch_size=100):
     print(index.describe_index_stats())
 
 
-generate_embeddings_and_upsert(chunks, index)
+if __name__ == "__main__":
+
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    index_name = "semantic-search-wiki"
+
+    # check if the index already exisits in pinecode if not creates a index with the following metrics
+    if not pc.has_index(index_name):
+        print(f"Initialising index deployement: {index_name}")
+        pc.create_index(
+            name=index_name,
+            dimension=1536,
+            metric="cosine",
+            spec=ServerlessSpec(
+                cloud="aws",  # Infrastructure host provider
+                region="us-east-1",  # Target region placement
+            ),
+        )
+        print(
+            f"✅ Success! Index '{index_name}' created under Serverless AWS footprint."
+        )
+    else:
+        print(f"ℹ️ Index '{index_name}' already exists in your Pinecone project.")
+
+    # connects your code to the Pinecone index named semantic-search-wiki.
+    index = pc.Index("semantic-search-wiki")
+    # describes the status of the index
+    print(index.describe_index_stats())
+
+    # fetching articles from wikepedia and accumilating it in articles =[]
+    articles = []
+    for topic in topics:
+        try:
+            page = wikipedia.page(
+                topic, auto_suggest=False
+            )  # auto_suggest is set to False because we do not want wikepedia to automatically alter the topic name while fetching articles
+            articles.append(
+                {
+                    "title": page.title,
+                    "content": page.content,
+                    "url": page.url,
+                    "pageid": page.pageid,
+                }
+            )
+            print(f"Loaded:{page.title}")
+            time.sleep(0.5)
+        except wikipedia.exceptions.DisambiguationError as e:
+            print(f"Disambiguation Error for '{topic}'. Options found: {e.options[:3]}")
+        except wikipedia.exceptions.PageError:
+            print(f"Page Error: '{topic}' does not exist on Wikipedia.")
+        except Exception as e:
+            print(f"Skipped '{topic}' due to an unexpected error: {e}")
+
+    print(f"total articles loaded:{len(articles)}")
+
+    chunks = generate_overlapping_chuncks(articles, chunck_size=200, overlap=50)
+
+    print("\n==================================================")
+    print("📊 PRODUCTION DATASET METRICS ANALYSIS")
+    print("==================================================")
+    print(f"Total Chunks Produced across 52 Articles: {len(chunks)}")
+
+    generate_embeddings_and_upsert(chunks, index)
