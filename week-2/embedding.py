@@ -38,7 +38,7 @@ print(f"Fetching embeddings for {len(sentences)} sentences...")
 
 response = client.embeddings.create(model="text-embedding-3-small", input=sentences)
 
-# print(type(response))
+print(response)
 
 embeddings = np.array([data.embedding for data in response.data])
 # print("embeddings :", embeddings)
