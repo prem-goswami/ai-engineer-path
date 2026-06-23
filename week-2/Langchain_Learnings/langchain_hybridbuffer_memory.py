@@ -42,6 +42,9 @@ summary_prompt = ChatPromptTemplate.from_messages(
 # Secondary independent chain tasked exclusively with background compression
 summary_compression_chain = summary_prompt | model | StrOutputParser()
 
+buffer_chain = prompt | model | StrOutputParser()
+
+
 # Global state trackers
 current_summary_text = "The user initiated the chat connection."
 
