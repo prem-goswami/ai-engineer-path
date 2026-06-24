@@ -5,15 +5,42 @@ from pinecone import Pinecone
 from openai import OpenAI
 from dotenv import load_dotenv
 
+# Langchain Imports
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+
 load_dotenv()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index_name = "semantic-search-wiki"
-
 index = pc.Index("semantic-search-wiki")
 
 
+# LangChain Unified Client Wrappers
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small", api_key=os.getenv("OPENAI_API_KEY")
+)
+
+# Connect LangChain's abstraction layer straight to  active index instance
+vectorstore = PineconeVectorStore(
+    index=index,
+    embedding=embeddings,
+    text_key="text",  # Points to metadata text key payload
+    namespace="semantic-search-wiki",
+)
+
+# Standardize your baseline retriever node configurations
+retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+llm = ChatOpenAI(
+    model="gpt-4o-mini", temperature=0.2, api_key=os.getenv("OPENAI_API_KEY")
+)
+
+# Initialize the primary application server instance
 app = FastAPI(title="Wikipedia Semantic Search Engine API")
 
 
@@ -88,8 +115,11 @@ def getSearchResults(request: SearchRequest):
     return SearchResponse(query=request.query, results=results)
 
 
+# RAG endpoint without using Langchain
 @app.post("/rag", response_model=RAGResponse)
 def rag_response(request: RAGRequest):
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     # retriving chunks of data from pinecone
     embeding_question = client.embeddings.create(
@@ -148,3 +178,69 @@ def rag_response(request: RAGRequest):
 
     answer = completion.choices[0].message.content.strip()
     return RAGResponse(question=request.question, answer=answer, sources=sources)
+
+
+rag_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a helpful assistant. Answer the user's question using 
+ONLY the provided context below. Do not use any outside knowledge.
+Cite your sources by referencing the article title in your answer.
+If the context does not contain enough information to answer,
+say 'I don't have enough information in my knowledge base to answer this.'
+
+Context:
+{context}""",
+        ),
+        ("human", "{input}"),
+    ]
+)
+
+
+# RAG endpoint by using Langchain modules
+@app.post("/LCrag", response_model=RAGResponse)
+def LCrag_response(request: RAGRequest):
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+    try:
+        # Dynamically set k at runtime to match what the client requested
+        # gets the query embedded, finds the matches and outputs a Document array
+        # object with the extracted text content from the matches
+        dynamic_retriever = vectorstore.as_retriever(search_kwargs={"k": request.top_k})
+
+        # runs through the Document Array and joints the different matches to create a content block
+        # creates a content block with original query with a type safe payload like 'System Message' and 'Human Message' """
+        stuff_chain = create_stuff_documents_chain(llm, rag_prompt)
+
+        rag_chain = create_retrieval_chain(dynamic_retriever, stuff_chain)
+
+        # Execute invocation over the abstract vector pipeline graph
+        result = rag_chain.invoke({"input": request.question})
+
+        # Extract LangChain's Document arrays and unpack them cleanly into our SearchResult schema
+        formatted_sources = []
+        for idx, doc in enumerate(result.get("context", []), 1):
+            metadata = doc.metadata
+            formatted_sources.append(
+                SearchResult(
+                    rank=idx,
+                    score=0.0,  # Standard LangChain retrievers hide cosine scores by default
+                    title=metadata.get("source_title", "Unknown"),
+                    url=metadata.get("source_url", ""),
+                    chunk_index=int(metadata.get("chunk_index", 0)),
+                    text=doc.page_content,
+                )
+            )
+
+        return RAGResponse(
+            question=request.question,
+            answer=result["answer"].strip(),
+            sources=formatted_sources,
+        )
+
+    except Exception as e:
+        print(f"❌ LangChain execution exception caught: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"LangChain pipeline error: {str(e)}"
+        )
