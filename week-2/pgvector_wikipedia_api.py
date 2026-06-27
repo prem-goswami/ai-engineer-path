@@ -150,6 +150,95 @@ Context:
 )
 
 
+def execute_hybrid_rerank_retrieval(query: str, top_k: int) -> list[PGSearchResult]:
+    # ==========================================
+    # ENGINE 1: DENSE VECTOR RETRIEVAL (pgvector)
+    # ==========================================
+    # A. Generate the text embedding coordinates via OpenAI
+    embedding_response = client.embeddings.create(
+        model="text-embedding-3-small", input=query
+    )
+    query_vector = embedding_response.data[0].embedding
+
+    # B. Query pgvector to get the top semantic matches based on distance
+    # We ask for a broad set (top 50) so we have enough overlap to fuse rankings later!
+    cursor = pg_conn.cursor(cursor_factory=RealDictCursor)
+
+    # we only ask for id and score as all the other data is already stored in RAW_CHUNKS_LOOKUP
+    cursor.execute(
+        """
+        SELECT 
+            id,
+            1 - (embedding <=> %s::vector) AS similarity_score
+        FROM documents
+        ORDER BY embedding <=> %s::vector
+        LIMIT 50
+        """,
+        (str(query_vector), str(query_vector)),
+    )
+    semantic_rows = cursor.fetchall()
+    cursor.close()
+
+    # ==========================================
+    # ENGINE 2: SPARSE KEYWORD RETRIEVAL (BM25)
+    # ==========================================
+    # A. Tokenize the incoming query string
+    tokenized_query = query.lower().split()
+
+    # B. Generate BM25 scores for EVERY single cached document chunk in memory
+    bm25_scores = GLOBAL_BM25.get_scores(tokenized_query)
+
+    print(f"Retrieved {len(semantic_rows)} vector matches and scored BM25.")
+
+    # ==========================================
+    # ENGINE 3: RECIPROCAL RANK FUSION (RRF) LOOP
+    # ==========================================
+    # Initialize a tracking dictionary: key = chunk_id, value = RRF score accumulation
+    rrf_scores = {}
+
+    # A. Score the Vector Stream candidates
+    # semantic_rows contains up to 50 rows from pgvector
+    for rank, row in enumerate(semantic_rows, 1):
+        chunk_id = row["id"]
+        # Apply the RRF fractional formula
+        rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + (1.0 / (60.0 + rank))
+
+    # B. Score the Keyword Stream candidates
+    # claculate top 50 matches as bm25_scores contains a score of all the chunks in the database
+    # Process the raw list of all 2947 scores into sorted (id, score) pairs
+    all_keys = list(RAW_CHUNKS_LOOKUP.keys())
+    all_bm25_matches = [(all_keys[idx], score) for idx, score in enumerate(bm25_scores)]
+    all_bm25_matches.sort(key=lambda x: x[1], reverse=True)
+    top_50_bm25 = all_bm25_matches[:50]
+
+    for rank, (chunk_id, score) in enumerate(top_50_bm25, 1):
+        # Accumulate scores. If a chunk exists in BOTH lists, its RRF score spikes!
+        rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + (1.0 / (60.0 + rank))
+
+    # C. Sort the unified tracking dict by RRF score descending
+    sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # D. Slice the final top results to match the user's requested limit
+    final_top_matches = sorted_rrf[:top_k]
+
+    # E. Reconstruct the full metadata rows from our memory vault (RAW_CHUNKS_LOOKUP)
+    final_results = []
+    for rank, (chunk_id, rrf_score) in enumerate(final_top_matches, 1):
+        cached_row = RAW_CHUNKS_LOOKUP[chunk_id]
+
+        final_results.append(
+            PGSearchResult(
+                rank=rank,
+                score=round(rrf_score, 4),  # Expose the final calculated RRF metric
+                title=cached_row["source"],
+                url=cached_row["source_url"],
+                chunk_index=cached_row["chunk_index"],
+                text=cached_row["content"],
+            )
+        )
+    return final_results
+
+
 @app.get("/")
 def health():
     return {
@@ -247,89 +336,42 @@ def hybrid_search(request: SearchRequest):
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-    # ==========================================
-    # ENGINE 1: DENSE VECTOR RETRIEVAL (pgvector)
-    # ==========================================
-    # A. Generate the text embedding coordinates via OpenAI
-    embedding_response = client.embeddings.create(
-        model="text-embedding-3-small", input=request.query
-    )
-    query_vector = embedding_response.data[0].embedding
+    retrived_hybrid_hits = execute_hybrid_rerank_retrieval(request.query, request.top_k)
 
-    # B. Query pgvector to get the top semantic matches based on distance
-    # We ask for a broad set (top 50) so we have enough overlap to fuse rankings later!
-    cursor = pg_conn.cursor(cursor_factory=RealDictCursor)
+    return HybridResponse(query=request.query, results=retrived_hybrid_hits)
 
-    # we only ask for id and score as all the other data is already stored in RAW_CHUNKS_LOOKUP
-    cursor.execute(
-        """
-        SELECT 
-            id,
-            1 - (embedding <=> %s::vector) AS similarity_score
-        FROM documents
-        ORDER BY embedding <=> %s::vector
-        LIMIT 50
-        """,
-        (str(query_vector), str(query_vector)),
-    )
-    semantic_rows = cursor.fetchall()
-    cursor.close()
 
-    # ==========================================
-    # ENGINE 2: SPARSE KEYWORD RETRIEVAL (BM25)
-    # ==========================================
-    # A. Tokenize the incoming query string
-    tokenized_query = request.query.lower().split()
+@app.post("/hybrid-rag", response_model=RAGResponse)
+def hybrid_rag_response(request: RAGRequest):
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    # B. Generate BM25 scores for EVERY single cached document chunk in memory
-    bm25_scores = GLOBAL_BM25.get_scores(tokenized_query)
-
-    print(f"Retrieved {len(semantic_rows)} vector matches and scored BM25.")
-
-    # ==========================================
-    # ENGINE 3: RECIPROCAL RANK FUSION (RRF) LOOP
-    # ==========================================
-    # Initialize a tracking dictionary: key = chunk_id, value = RRF score accumulation
-    rrf_scores = {}
-
-    # A. Score the Vector Stream candidates
-    # semantic_rows contains up to 50 rows from pgvector
-    for rank, row in enumerate(semantic_rows, 1):
-        chunk_id = row["id"]
-        # Apply the RRF fractional formula
-        rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + (1.0 / (60.0 + rank))
-
-    # B. Score the Keyword Stream candidates
-    # claculate top 50 matches as bm25_scores contains a score of all the chunks in the database
-    # Process the raw list of all 2947 scores into sorted (id, score) pairs
-    all_bm25_matches = [(idx + 1, score) for idx, score in enumerate(bm25_scores)]
-    all_bm25_matches.sort(key=lambda x: x[1], reverse=True)
-    top_50_bm25 = all_bm25_matches[:50]
-
-    for rank, (chunk_id, score) in enumerate(top_50_bm25, 1):
-        # Accumulate scores. If a chunk exists in BOTH lists, its RRF score spikes!
-        rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + (1.0 / (60.0 + rank))
-
-    # C. Sort the unified tracking dict by RRF score descending
-    sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-
-    # D. Slice the final top results to match the user's requested limit
-    final_top_matches = sorted_rrf[: request.top_k]
-
-    # E. Reconstruct the full metadata rows from our memory vault (RAW_CHUNKS_LOOKUP)
-    final_results = []
-    for rank, (chunk_id, rrf_score) in enumerate(final_top_matches, 1):
-        cached_row = RAW_CHUNKS_LOOKUP[chunk_id]
-
-        final_results.append(
-            PGSearchResult(
-                rank=rank,
-                score=round(rrf_score, 4),  # Expose the final calculated RRF metric
-                title=cached_row["source"],
-                url=cached_row["source_url"],
-                chunk_index=cached_row["chunk_index"],
-                text=cached_row["content"],
-            )
+    try:
+        retrieved_hits = execute_hybrid_rerank_retrieval(
+            request.question, request.top_k
         )
 
-    return HybridResponse(query=request.query, results=final_results)
+        # Parse out text arrays for prompt context injection
+        context_chunks = []
+        for hit in retrieved_hits:
+            context_chunks.append(f"Document Source: {hit.title}\nContent: {hit.text}")
+
+        combined_context_string = "\n\n---\n\n".join(context_chunks)
+
+        # Format template and invoke OpenAI via LangChain
+        hydrated_messages = rag_prompt.format_messages(
+            context=combined_context_string, input=request.question
+        )
+        llm_response = llm.invoke(hydrated_messages)
+
+        return RAGResponse(
+            question=request.question.strip(),
+            answer=llm_response.content.strip(),
+            sources=retrieved_hits,
+        )
+
+    except Exception as e:
+        print(f"❌ Hybrid RAG pipeline exception caught: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Hybrid RAG execution error: {str(e)}"
+        )
