@@ -19,6 +19,9 @@ from langchain_core.prompts import ChatPromptTemplate
 # BM25 imports
 from rank_bm25 import BM25Okapi
 
+# rerank imports
+from reranker import rerank
+
 load_dotenv()
 
 if os.name == "nt":
@@ -130,6 +133,21 @@ class RAGResponse(BaseModel):
 class HybridResponse(BaseModel):
     query: str
     results: list[PGSearchResult]
+
+
+class RerankedResult(BaseModel):
+    rank: int
+    rerank_score: float
+    original_rank: int
+    title: str
+    url: str
+    chunk_index: int
+    text: str
+
+
+class RerankedResponse(BaseModel):
+    query: str
+    results: list[RerankedResult]
 
 
 rag_prompt = ChatPromptTemplate.from_messages(
@@ -375,3 +393,68 @@ def hybrid_rag_response(request: RAGRequest):
         raise HTTPException(
             status_code=500, detail=f"Hybrid RAG execution error: {str(e)}"
         )
+
+
+@app.post("/search-reranked", response_model=RerankedResponse)
+def search_reranked(request: SearchRequest):
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    # Step 1 — Retrieve top-10 from pgvector
+    embedding_response = client.embeddings.create(
+        model="text-embedding-3-small", input=request.query
+    )
+    query_vector = embedding_response.data[0].embedding
+
+    cursor = pg_conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute(
+        """
+        SELECT
+            id,
+            content,
+            source,
+            source_url,
+            chunk_index,
+            1 - (embedding <=> %s::vector) AS similarity_score
+        FROM documents
+        ORDER BY embedding <=> %s::vector
+        LIMIT 10
+        """,
+        (str(query_vector), str(query_vector)),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+
+    # Step 2 — Format candidates for reranker
+    candidates = []
+    for rank, row in enumerate(rows, 1):
+        candidates.append(
+            {
+                "original_rank": rank,  # rank before the rerank
+                "title": row["source"],
+                "url": row["source_url"],
+                "chunk_index": row["chunk_index"],
+                "text": row["content"],
+                "similarity_score": float(row["similarity_score"]),
+            }
+        )
+
+    # Step 3 — Rerank top-10 → top-3
+    reranked = rerank(request.query, candidates, top_k=3)
+
+    # Step 4 — Build response
+    results = []
+    for rank, item in enumerate(reranked, 1):
+        results.append(
+            RerankedResult(
+                rank=rank,
+                rerank_score=round(item["rerank_score"], 4),
+                original_rank=item["original_rank"],
+                title=item["title"],
+                url=item["url"],
+                chunk_index=item["chunk_index"],
+                text=item["text"],
+            )
+        )
+
+    return RerankedResponse(query=request.query, results=results)
