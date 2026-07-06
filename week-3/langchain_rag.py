@@ -47,7 +47,7 @@ def load_and_chunk_pdf(pdf_path: str) -> list:
     chunks = splitter.split_documents(pages)
     print(f"Split into {len(chunks)} chunks")
 
-    # Inspect first chunk so you can see what a Document looks like
+    # Inspect first chunk to see what a Document looks like
     print(f"\n--- First chunk ---")
     print(f"Content: {chunks[0].page_content[:200]}...")
     print(f"Metadata: {chunks[0].metadata}")
@@ -124,7 +124,7 @@ def build_rag_chain(vector_store: PGVectorStore):
     # Chain 1: stuffs retrieved docs into the prompt + calls LLM
     stuff_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
 
-    # Chain 2: wires retriever -> stuff_chain end to end
+    # Chain 2: wires retriever -> stuff_chain end to end(retriever and combine_docs_chain are keywords)
     rag_chain = create_retrieval_chain(
         retriever=retriever, combine_docs_chain=stuff_chain
     )
@@ -136,6 +136,7 @@ def query(rag_chain, question: str) -> dict:
     """Run a question through the RAG chain and print results"""
 
     print(f"\nQuestion: {question}")
+
     response = rag_chain.invoke({"input": question})
 
     print(f"Answer: {response['answer']}")
