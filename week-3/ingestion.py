@@ -145,10 +145,20 @@ async def ingest_pdf(job_id: str, pdf_path: str, filename: str):
             print(
                 f"[Worker] Embedding and streaming {len(chunks)} chunks down to pgvector..."
             )
-            vectorStore.add_documents(chunks)
-            return len(chunks)
+            # Capture the generated list of database UUID strings returned by LangChain
+            generated_ids = vectorStore.add_documents(chunks)
+            return generated_ids
 
-        chunk_count = await asyncio.get_event_loop().run_in_executor(None, store_chunks)
+        db_uuid_strings = await asyncio.get_event_loop().run_in_executor(
+            None, store_chunks
+        )
+
+        chunk_count = len(db_uuid_strings)
+
+        # Synchronize the primary DB tracking keys back into our in-memory chunk objects
+        # This ensures that when update_bm25 saves them to disk, they match the database rows exactly.
+        for chunk_obj, generated_uuid in zip(chunks, db_uuid_strings):
+            chunk_obj.metadata["id"] = str(generated_uuid)
 
         # Phase D: Update localized BM25 sparse vocabulary models incrementally
         print(

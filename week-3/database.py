@@ -32,7 +32,7 @@ def get_vector_store() -> PGVectorStore:
     embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
 
     return PGVectorStore.create_sync(
-        engine=engine, embeddings=embeddings, table_name=COLLECTION_NAME
+        engine=engine, embedding_service=embeddings, table_name=COLLECTION_NAME
     )
 
 
