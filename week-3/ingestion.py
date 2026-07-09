@@ -49,7 +49,7 @@ def load_bm25():
     return payload.get("bm25"), payload.get("chunks", [])
 
 
-def update_bm25(new_chunks: str):
+def update_bm25(new_chunks: list):
     _, existing_chunks = load_bm25()
 
     latest_chunks_dict = [

@@ -22,10 +22,34 @@ from config import (
 engine = PGEngine.from_connection_string(DATABASE_URL)
 
 
-def init_vectorstore_table():
-    engine.init_vectorstore_table(
-        table_name=COLLECTION_NAME, vector_size=VECTOR_SIZE, overwrite=False
-    )
+# def init_vectorstore_table():
+#     engine.init_vectorstore_table(table_name=COLLECTION_NAME, vector_size=VECTOR_SIZE)
+
+
+async def init_vectorstore_table():
+    """Manually creates the vector table if it doesn't exist."""
+
+    # We use a multiline string (triple quotes) to hold the SQL
+    create_table_sql = """
+        CREATE TABLE IF NOT EXISTS week3_rag_docs (
+            langchain_id UUID PRIMARY KEY,
+            content TEXT NOT NULL,
+            embedding vector(1536) NOT NULL,
+            langchain_metadata JSONB
+        );
+    """
+
+    # We create the index separately
+    create_index_sql = """
+        CREATE INDEX IF NOT EXISTS ix_week3_rag_docs_embedding 
+        ON week3_rag_docs USING hnsw (embedding vector_cosine_ops);
+    """
+
+    # We use the connection to actually execute the string
+    async with get_db_conn() as conn:
+        await conn.execute(create_table_sql)
+        await conn.execute(create_index_sql)
+        print("[Database] Verified table 'week3_rag_docs' exists.")
 
 
 def get_vector_store() -> PGVectorStore:

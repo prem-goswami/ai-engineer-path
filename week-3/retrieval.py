@@ -108,29 +108,28 @@ def reciprocal_rank_fusion(
         if uid not in chunk_store:
             chunk_store[uid] = chunk
         # 2. Process sparse keyword BM25 results list and accumulate weights
-        for rank, chunk in enumerate(bm25_results, 1):
-            uid = chunk["chunk_id"]
+    for rank, chunk in enumerate(bm25_results, 1):
+        uid = chunk["chunk_id"]
 
-            rrf_scores[uid] = rrf_scores.get(uid, 0.0) + (1.0 / (k + rank))
+        rrf_scores[uid] = rrf_scores.get(uid, 0.0) + (1.0 / (k + rank))
 
-            if uid not in chunk_store:
-                chunk_store[uid] = chunk
+        if uid not in chunk_store:
+            chunk_store[uid] = chunk
 
-        # Sort unique tracking IDs descending by their aggregated multi-channel weights
-        sorted_uids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
+    # Sort unique tracking IDs descending by their aggregated multi-channel weights
+    sorted_uids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
 
-        # Reconstruct our pruned evaluation pool up to our configuration window constraint (Top-10)
-        fused_candidates = []
-        for uid in sorted_uids[:top_k]:
-            base_payload = chunk_store[uid]
-            # Inject the final calculated rrf score directly into the returned payload dict
-            fused_candidates.append(
-                {**base_payload, "rrf_score": round(rrf_scores[uid], 6)}
-            )
-        print(
-            f"[RRF Fusion] Deduplication complete. Forwarding Top-{len(fused_candidates)} consensus candidates."
+    fused_candidates = []
+    for uid in sorted_uids[:top_k]:
+        base_payload = chunk_store[uid]
+        fused_candidates.append(
+            {**base_payload, "rrf_score": round(rrf_scores[uid], 6)}
         )
-        return fused_candidates
+
+    print(
+        f"[RRF Fusion] Deduplication complete. Forwarding Top-{len(fused_candidates)} consensus candidates."
+    )
+    return fused_candidates
 
 
 def rerank(query: str, candidates: list[dict], top_k: int = FINAL_TOP_K) -> list[dict]:
