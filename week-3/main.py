@@ -21,7 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 
-from config import UPLOAD_DIR, ALLOWED_EXTENSION, LLM_MODEL, OPENAI_API_KEY, FINAL_TOP_K
+from config import UPLOAD_DIR, ALLOWED_EXTENSION, LLM_MODEL, OPENAI_API_KEY
 from database import (
     init_vectorstore_table,
     init_job_table,
@@ -29,7 +29,7 @@ from database import (
     get_job,
     get_db_conn,
 )
-from ingestion import ingest_pdf, rebuild_bm25_from_db
+from ingestion import ingest_file, rebuild_bm25_from_db
 from retrieval import hybrid_retrieve
 from models import (
     UploadResponse,
@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
     # STARTUP
     print("[Startup] Initializing database tables...")
     Path(UPLOAD_DIR).mkdir(exist_ok=True)  # create uploads/ dir if missing
-    init_vectorstore_table()  # create pgvector table if not exists
+    await init_vectorstore_table()  # create pgvector table if not exists
     await init_job_table()  # create processing_jobs table if not exists
     print("[Startup] Ready.")
     yield
@@ -91,18 +91,28 @@ stuff_chain = create_stuff_documents_chain(llm=llm, prompt=CITATION_PROMPT)
 
 
 # ── Helpers ───────────────────────────────────────────────
-def validate_pdf(file: UploadFile) -> None:
-    """Raise HTTPException if file is not a valid PDF."""
+# def validate_pdf(file: UploadFile) -> None:
+#     """Raise HTTPException if file is not a valid PDF."""
+#     ext = Path(file.filename).suffix.lower()
+#     if ext != ALLOWED_EXTENSION:
+#         raise HTTPException(
+#             status_code=400,
+#             detail=f"Invalid file type '{ext}'. Only .pdf files are accepted.",
+#         )
+#     if file.content_type not in ("application/pdf", "application/octet-stream"):
+#         raise HTTPException(
+#             status_code=400,
+#             detail=f"Invalid content type '{file.content_type}'. Expected application/pdf.",
+#         )
+
+
+def validate_file_extension(file: UploadFile) -> None:
+    """Raise HTTPException if file extension is not supported."""
     ext = Path(file.filename).suffix.lower()
-    if ext != ALLOWED_EXTENSION:
+    if ext not in ALLOWED_EXTENSION:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid file type '{ext}'. Only .pdf files are accepted.",
-        )
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid content type '{file.content_type}'. Expected application/pdf.",
+            detail=f"Invalid file type '{ext}'. Supported types are: {', '.join(ALLOWED_EXTENSION)}",
         )
 
 
@@ -111,16 +121,16 @@ def validate_pdf(file: UploadFile) -> None:
 
 # POST /upload
 @app.post("/upload", response_model=UploadResponse, status_code=202)
-async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
-    Accept a PDF upload, save to disk, return job_id immediately.
+    Accept a file upload, save to disk, return job_id immediately.
     Processing happens in the background — poll /status/{job_id} for updates.
     202 Accepted = request received, processing not yet complete.
     """
     # Step 1 — validate file type before touching disk
-    validate_pdf(file)
+    validate_file_extension(file)
 
-    # Step 2 — save PDF to uploads/ directory
+    # Step 2 — save file to uploads/ directory
     upload_path = Path(UPLOAD_DIR) / file.filename
     try:
         with open(upload_path, "wb") as buffer:
@@ -133,12 +143,12 @@ async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
 
     # Step 4 — register background task and return immediately
     background_tasks.add_task(
-        ingest_pdf, job_id=job_id, pdf_path=str(upload_path), filename=file.filename
+        ingest_file, job_id=job_id, file_path=str(upload_path), filename=file.filename
     )
 
     return UploadResponse(
         job_id=job_id,
-        message="PDF upload accepted. Processing in background.",
+        message="file upload accepted. Processing in background.",
         filename=file.filename,
     )
 
@@ -174,7 +184,7 @@ async def query(request: QueryRequest):
     if not chunks:
         raise HTTPException(
             status_code=404,
-            detail="No relevant documents found. Upload PDFs before querying.",
+            detail="No relevant documents found. Upload files before querying.",
         )
 
     # Step 2 — convert retrieved dicts back to LangChain Document objects for stuff_chain
@@ -258,7 +268,7 @@ async def delete_document(document_id: str):
                 SELECT COUNT(*) FROM {COLLECTION_NAME}
                 WHERE langchain_metadata->>'source_filename' = %s
                 """,
-                (document_id),
+                (document_id,),
             )
             count = (await count_row.fetchone())[0]
 
@@ -273,7 +283,7 @@ async def delete_document(document_id: str):
                 DELETE FROM {COLLECTION_NAME}
                 WHERE langchain_metadata->>'source_filename' = %s
                 """,
-                (document_id),
+                (document_id,),
             )
 
     except HTTPException:

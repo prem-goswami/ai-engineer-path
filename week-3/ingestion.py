@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 
 # Core LangChain document parsers and slicing utilities
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -14,11 +14,29 @@ from rank_bm25 import BM25Okapi
 from config import CHUNK_SIZE, CHUNK_OVERLAP, BM25_INDEX_PATH, COLLECTION_NAME
 from database import get_db_conn, get_vector_store, update_job
 
+# 1. Define a mapping for supported types
+LOADER_MAPPING = {
+    ".pdf": PyPDFLoader,
+    ".txt": TextLoader,
+    ".docx": Docx2txtLoader,
+}
 
-def load_and_chunk_pdf(pdf_path: str, source_filename: str):
-    print(f"[Ingestion] Instantiating PyPDFLoader for path: {pdf_path}")
 
-    loader = PyPDFLoader(pdf_path)
+def load_and_chunk_file(file_path: str, source_filename: str):
+    """
+    Dynamically selects the loader based on file extension.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext not in LOADER_MAPPING:
+        raise ValueError(
+            f"Unsupported file type: {ext}. Supported: {list(LOADER_MAPPING.keys())}"
+        )
+    print(
+        f"[Ingestion] Instantiating {LOADER_MAPPING[ext].__name__} for path: {file_path}"
+    )
+
+    loader = LOADER_MAPPING[ext](file_path)
     pages = loader.load()
 
     print(f"[Ingestion] Successfully read {len(pages)} source layout pages.")
@@ -84,15 +102,9 @@ async def rebuild_bm25_from_db():
 
     async with get_db_conn() as conn:
 
-        cursor = await conn.execute(
-            """
-            SELECT e.document, e.cmetadata
-            FROM langchain_pg_embedding e
-            JOIN langchain_pg_collection c ON e.collection_id = c.uuid
-            WHERE c.name = %s
-            """,
-            (COLLECTION_NAME,),
-        )
+        cursor = await conn.execute("""
+            SELECT content, langchain_metadata FROM week3_rag_docs
+            """)
         records = await cursor.fetchall()
 
     if not records:
@@ -120,7 +132,7 @@ async def rebuild_bm25_from_db():
     )
 
 
-async def ingest_pdf(job_id: str, pdf_path: str, filename: str):
+async def ingest_file(job_id: str, file_path: str, filename: str):
     """
     Coordinates the full non-blocking asynchronous document ingestion.
     Updates the transactional processing_jobs schema state dynamically at each phase.
@@ -135,7 +147,7 @@ async def ingest_pdf(job_id: str, pdf_path: str, filename: str):
         # run_in_executor offloads the heavy CPU block away from FastAPI's primary thread
         print(f"[Worker] Dispatching PyPDFLoader tokenization loop to thread pool...")
         chunks = await asyncio.get_event_loop().run_in_executor(
-            None, load_and_chunk_pdf, pdf_path, filename
+            None, load_and_chunk_file, file_path, filename
         )
 
         # Phase C: Embed vectors and upsert to pgvector table space
@@ -185,6 +197,6 @@ async def ingest_pdf(job_id: str, pdf_path: str, filename: str):
 
     finally:
         # Phase F: Always execute OS storage cleanup to eliminate temporary byte leaks
-        if Path(pdf_path).exists():
-            print(f"[Worker] Evicting ephemeral scratch file from disk: {pdf_path}")
-            os.remove(pdf_path)
+        if Path(file_path).exists():
+            print(f"[Worker] Evicting ephemeral scratch file from disk: {file_path}")
+            os.remove(file_path)

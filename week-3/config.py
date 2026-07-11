@@ -36,4 +36,4 @@ BM25_INDEX_PATH = "bm25_index.pkl"  # persisted index location
 
 # ── File Upload ───────────────────────────────────────────
 UPLOAD_DIR = "uploads"  # temp PDF storage
-ALLOWED_EXTENSION = ".pdf"
+ALLOWED_EXTENSION = {".pdf", ".txt", ".docx"}
