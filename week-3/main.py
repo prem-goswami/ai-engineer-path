@@ -2,6 +2,7 @@ import os
 import shutil
 import asyncio
 import sys
+import json
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
@@ -68,7 +69,9 @@ app = FastAPI(
 
 
 # ── LLM + Prompt (module level — loaded once) ─────────────
-llm = ChatOpenAI(model=LLM_MODEL, temperature=0, openai_api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(
+    model=LLM_MODEL, temperature=0, streaming=True, openai_api_key=OPENAI_API_KEY
+)
 
 CITATION_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -91,21 +94,6 @@ stuff_chain = create_stuff_documents_chain(llm=llm, prompt=CITATION_PROMPT)
 
 
 # ── Helpers ───────────────────────────────────────────────
-# def validate_pdf(file: UploadFile) -> None:
-#     """Raise HTTPException if file is not a valid PDF."""
-#     ext = Path(file.filename).suffix.lower()
-#     if ext != ALLOWED_EXTENSION:
-#         raise HTTPException(
-#             status_code=400,
-#             detail=f"Invalid file type '{ext}'. Only .pdf files are accepted.",
-#         )
-#     if file.content_type not in ("application/pdf", "application/octet-stream"):
-#         raise HTTPException(
-#             status_code=400,
-#             detail=f"Invalid content type '{file.content_type}'. Expected application/pdf.",
-#         )
-
-
 def validate_file_extension(file: UploadFile) -> None:
     """Raise HTTPException if file extension is not supported."""
     ext = Path(file.filename).suffix.lower()
@@ -114,6 +102,26 @@ def validate_file_extension(file: UploadFile) -> None:
             status_code=400,
             detail=f"Invalid file type '{ext}'. Supported types are: {', '.join(ALLOWED_EXTENSION)}",
         )
+
+
+# ── Stream Response Query ─────────────────────────────────────────────
+async def stream_query_response(
+    question: str, documents: list[Document], sources: list[SourceChunk]
+):
+    """
+    Async generator — yields tokens as the LLM produces them,
+    then yields a final delimited block containing source citations.
+    """
+    # Why astream() over invoke() — the actual mechanism: invoke() sends the request, blocks,
+    # and returns only when OpenAI's API has finished generating every token. astream()
+    # opens the same request but reads the response as a Server-Sent Events stream from OpenAI's API itself
+    async for token in stuff_chain.astream({"input": question, "context": documents}):
+        yield token
+
+    # Sources arrive AFTER the answer is fully streamed.
+    # Client-side, split on this delimiter to separate answer text from citation data.
+    sources_json = json.dumps([s.model_dump() for s in sources], default=str)
+    yield f"\n\n__SOURCES__{sources_json}"
 
 
 # ── Endpoints ─────────────────────────────────────────────
@@ -217,6 +225,41 @@ async def query(request: QueryRequest):
     ]
 
     return QueryResponse(answer=answer, sources=sources, question=request.question)
+
+
+# POST /query/stream
+@app.post("/query/stream")
+async def query_stream(request: QueryRequest):
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    # Retrieval is still synchronous (BM25, cross-encoder, pgvector) — still needs run_in_executor
+    chunks = await asyncio.get_event_loop().run_in_executor(
+        None, hybrid_retrieve, request.question
+    )
+    if not chunks:
+        raise HTTPException(status_code=404, detail="No relevant documents found.")
+
+    documents = [
+        Document(page_content=c["text"], metadata=c["metadata"]) for c in chunks
+    ]
+    sources = [
+        SourceChunk(
+            chunk_id=str(c["chunk_id"]),
+            source=c["metadata"].get("source_filename", "unknown"),
+            page=c["metadata"].get("page", 0),
+            content_preview=c["text"][:200],
+            rerank_score=c.get("rerank_score", 0.0),
+            original_rank=c.get("original_rank", 0),
+        )
+        for c in chunks
+    ]
+
+    # No response_model here — StreamingResponse and Pydantic validation don't mix
+    return StreamingResponse(
+        stream_query_response(request.question, documents, sources),
+        media_type="text/event-stream",
+    )
 
 
 # GET /documents
