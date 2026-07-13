@@ -60,6 +60,19 @@ def get_vector_store() -> PGVectorStore:
     )
 
 
+# parents database
+async def init_parent_docs_table():
+    async with get_db_conn() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS parent_documents (
+                parent_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                parent_text    TEXT NOT NULL,
+                source_filename TEXT NOT NULL,
+                page           INT
+            )
+        """)
+
+
 # ── Raw psycopg3 Connection Layer ───────────────────────────
 # createa a async manager that manages connections opening and closing with the db using conn using psycopg
 @asynccontextmanager
@@ -151,3 +164,60 @@ async def get_job(job_id: str):
     ]
 
     return dict(zip(cols, record))
+
+
+# database.py additions
+
+
+async def init_costs_table():
+    async with get_db_conn() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS query_costs (
+                id                   SERIAL PRIMARY KEY,
+                query_id             UUID NOT NULL DEFAULT gen_random_uuid(),
+                question             TEXT NOT NULL,
+                created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                num_chunks_retrieved INT NOT NULL,
+                context_tokens       INT NOT NULL,
+                prompt_tokens        INT NOT NULL,
+                completion_tokens    INT NOT NULL,
+                embedding_cost_usd   NUMERIC(10,6) NOT NULL,
+                input_cost_usd       NUMERIC(10,6) NOT NULL,
+                output_cost_usd      NUMERIC(10,6) NOT NULL,
+                total_cost_usd       NUMERIC(10,6) NOT NULL
+            )
+        """)
+
+
+async def log_query_cost(
+    question: str,
+    num_chunks: int,
+    context_tokens: int,
+    prompt_tokens: int,
+    completion_tokens: int,
+    embedding_cost: float,
+    input_cost: float,
+    output_cost: float,
+):
+    total_cost = embedding_cost + input_cost + output_cost
+    async with get_db_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO query_costs
+                (question, num_chunks_retrieved, context_tokens, prompt_tokens,
+                 completion_tokens, embedding_cost_usd, input_cost_usd,
+                 output_cost_usd, total_cost_usd)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                question,
+                num_chunks,
+                context_tokens,
+                prompt_tokens,
+                completion_tokens,
+                embedding_cost,
+                input_cost,
+                output_cost,
+                total_cost,
+            ),
+        )

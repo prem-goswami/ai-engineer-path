@@ -3,6 +3,7 @@ import shutil
 import asyncio
 import sys
 import json
+import tiktoken
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -22,15 +23,26 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 
-from config import UPLOAD_DIR, ALLOWED_EXTENSION, LLM_MODEL, OPENAI_API_KEY
+from config import (
+    UPLOAD_DIR,
+    ALLOWED_EXTENSION,
+    LLM_MODEL,
+    OPENAI_API_KEY,
+    EMBEDDING_COST_PER_1K,
+    INPUT_COST_PER_1K,
+    OUTPUT_COST_PER_1K,
+)
 from database import (
     init_vectorstore_table,
     init_job_table,
+    init_parent_docs_table,
+    init_costs_table,
     create_job,
     get_job,
     get_db_conn,
+    log_query_cost,
 )
-from ingestion import ingest_file, rebuild_bm25_from_db
+from ingestion import ingest_file, rebuild_bm25_from_db, count_tokens
 from retrieval import hybrid_retrieve
 from models import (
     UploadResponse,
@@ -54,6 +66,8 @@ async def lifespan(app: FastAPI):
     Path(UPLOAD_DIR).mkdir(exist_ok=True)  # create uploads/ dir if missing
     await init_vectorstore_table()  # create pgvector table if not exists
     await init_job_table()  # create processing_jobs table if not exists
+    await init_parent_docs_table()  # creating parents table if not exsist
+    await init_costs_table()  # creating cost table if not exsists
     print("[Startup] Ready.")
     yield
     # SHUTDOWN (nothing to clean up for now)
@@ -112,11 +126,42 @@ async def stream_query_response(
     Async generator — yields tokens as the LLM produces them,
     then yields a final delimited block containing source citations.
     """
+
+    # Reconstruct the full text sent to the LLM to calculate prompt tokens
+    context_text = "\n\n".join([doc.page_content for doc in documents])
+    full_prompt = f"Context:\n{context_text}\n\nQuestion:\n{question}"
+
+    encoding = tiktoken.encoding_for_model(LLM_MODEL)
+    prompt_tokens = len(encoding.encode(full_prompt))
+
+    generated_answer = ""
+
     # Why astream() over invoke() — the actual mechanism: invoke() sends the request, blocks,
     # and returns only when OpenAI's API has finished generating every token. astream()
     # opens the same request but reads the response as a Server-Sent Events stream from OpenAI's API itself
     async for token in stuff_chain.astream({"input": question, "context": documents}):
+        generated_answer += token
         yield token
+
+    # Stream is over. Calculate the output tokens
+    completion_tokens = len(encoding.encode(generated_answer))
+
+    input_cost = (prompt_tokens / 1000) * INPUT_COST_PER_1K
+    output_cost = (completion_tokens / 1000) * OUTPUT_COST_PER_1K
+
+    # We use create_task so it doesn't block the final sources from sending!
+    asyncio.create_task(
+        log_query_cost(
+            question=question,
+            num_chunks=len(documents),
+            context_tokens=len(encoding.encode(context_text)),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            embedding_cost=0.0,
+            input_cost=input_cost,
+            output_cost=output_cost,
+        )
+    )
 
     # Sources arrive AFTER the answer is fully streamed.
     # Client-side, split on this delimiter to separate answer text from citation data.
@@ -183,9 +228,7 @@ async def query(request: QueryRequest):
 
     # Step 1 — hybrid retrieval (sync — run in thread pool)
     try:
-        chunks = await asyncio.get_event_loop().run_in_executor(
-            None, hybrid_retrieve, request.question
-        )
+        chunks = await hybrid_retrieve(request.question)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Retrieval failed: {str(e)}")
 
@@ -200,6 +243,12 @@ async def query(request: QueryRequest):
         Document(page_content=c["text"], metadata=c["metadata"]) for c in chunks
     ]
 
+    # Count context tokens BEFORE calling the LLM
+    context_text = "\n\n".join(d.page_content for d in documents)
+    context_tokens = count_tokens(context_text)
+    question_tokens = count_tokens(request.question)
+    prompt_tokens = context_tokens + question_tokens
+
     # Step 3 — LLM answer generation (sync — run in thread pool)
     try:
         answer = await asyncio.get_event_loop().run_in_executor(
@@ -210,6 +259,23 @@ async def query(request: QueryRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {str(e)}")
+
+    completion_tokens = count_tokens(answer)
+    # Cost math
+    embedding_cost = (question_tokens / 1000) * EMBEDDING_COST_PER_1K
+    input_cost = (prompt_tokens / 1000) * INPUT_COST_PER_1K
+    output_cost = (completion_tokens / 1000) * OUTPUT_COST_PER_1K
+
+    await log_query_cost(
+        question=request.question,
+        num_chunks=len(chunks),
+        context_tokens=context_tokens,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        embedding_cost=embedding_cost,
+        input_cost=input_cost,
+        output_cost=output_cost,
+    )
 
     # Step 4 — build source citations from chunk metadata
     sources = [
@@ -234,9 +300,7 @@ async def query_stream(request: QueryRequest):
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     # Retrieval is still synchronous (BM25, cross-encoder, pgvector) — still needs run_in_executor
-    chunks = await asyncio.get_event_loop().run_in_executor(
-        None, hybrid_retrieve, request.question
-    )
+    chunks = await hybrid_retrieve(request.question)
     if not chunks:
         raise HTTPException(status_code=404, detail="No relevant documents found.")
 
@@ -359,4 +423,28 @@ async def health():
         "status": "healthy" if db_status == "healthy" else "degraded",
         "database": db_status,
         "vector_store": COLLECTION_NAME,
+    }
+
+
+# See Query Costs
+@app.get("/costs")
+async def get_costs():
+    async with get_db_conn() as conn:
+        total_row = await conn.execute(
+            "SELECT SUM(total_cost_usd), COUNT(*) FROM query_costs"
+        )
+        total_cost, total_queries = await total_row.fetchone()
+
+        breakdown_rows = await conn.execute(
+            "SELECT question, total_cost_usd, created_at FROM query_costs ORDER BY created_at DESC LIMIT 50"
+        )
+        breakdown = await breakdown_rows.fetchall()
+
+    return {
+        "total_spend_usd": float(total_cost or 0),
+        "total_queries": total_queries,
+        "recent_queries": [
+            {"question": r[0], "cost_usd": float(r[1]), "timestamp": r[2].isoformat()}
+            for r in breakdown
+        ],
     }

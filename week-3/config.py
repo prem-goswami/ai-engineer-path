@@ -37,3 +37,8 @@ BM25_INDEX_PATH = "bm25_index.pkl"  # persisted index location
 # ── File Upload ───────────────────────────────────────────
 UPLOAD_DIR = "uploads"  # temp PDF storage
 ALLOWED_EXTENSION = {".pdf", ".txt", ".docx"}
+
+# config.py additions
+EMBEDDING_COST_PER_1K = 0.00002  # text-embedding-3-small
+INPUT_COST_PER_1K = 0.00015  # gpt-4o-mini input
+OUTPUT_COST_PER_1K = 0.0006  # gpt-4o-mini output

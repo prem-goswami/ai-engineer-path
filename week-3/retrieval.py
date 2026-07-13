@@ -159,7 +159,51 @@ def rerank(query: str, candidates: list[dict], top_k: int = FINAL_TOP_K) -> list
     return final_output
 
 
-def hybrid_retrieve(query: str) -> list[dict]:
+async def resolve_parents(child_candidates: list[dict]) -> list[dict]:
+    """
+    Given child chunks (from semantic/BM25/RRF), fetch their parent's
+    full text and swap it in before reranking. De-duplicates parent_ids
+    so if 3 children map to the same parent, that parent's text appears once.
+    """
+    parent_ids = list(
+        {
+            c["metadata"].get("parent_id")
+            for c in child_candidates
+            if c["metadata"].get("parent_id")
+        }
+    )
+    if not parent_ids:
+        return child_candidates  # no parent linkage — fall back to child text as-is
+
+    async with get_db_conn() as conn:
+        rows = await conn.execute(
+            "SELECT parent_id, parent_text FROM parent_documents WHERE parent_id = ANY(%s)",
+            (parent_ids,),
+        )
+        records = await rows.fetchall()
+    parent_lookup = {str(pid): text for pid, text in records}
+
+    resolved = []
+    seen_parents = set()
+    for c in child_candidates:
+        parent_id = c["metadata"].get("parent_id")
+        if parent_id and parent_id in parent_lookup:
+            if parent_id in seen_parents:
+                continue  # this parent's full text already added — skip duplicate child
+            seen_parents.add(parent_id)
+            resolved.append(
+                {
+                    **c,
+                    "text": parent_lookup[parent_id],  # swap child text for parent text
+                }
+            )
+        else:
+            resolved.append(c)  # no parent found — keep child text
+
+    return resolved
+
+
+async def hybrid_retrieve(query: str) -> list[dict]:
     """
     Full pipeline:
     semantic(50) + bm25(50) → RRF → top 10 → cross-encoder → top 3
@@ -174,10 +218,13 @@ def hybrid_retrieve(query: str) -> list[dict]:
     )
 
     fused = reciprocal_rank_fusion(semantic_results, bm25_results)
+
+    fused = await resolve_parents(fused)
     print(
         f"[Hybrid Pipeline] After RRF deduplication: {len(fused)} candidate windows forwarded."
     )
 
+    # resolve to parent text before reranking
     final = rerank(query, fused)
     print(
         f"[Hybrid Pipeline] Pipeline executed successfully. Returning top-{len(final)} grounded facts for generation.\n"

@@ -1,6 +1,9 @@
 import os
 import pickle
 import asyncio
+
+# ingestion / retrieval — token counting
+import tiktoken
 from pathlib import Path
 
 # Core LangChain document parsers and slicing utilities
@@ -20,6 +23,70 @@ LOADER_MAPPING = {
     ".txt": TextLoader,
     ".docx": Docx2txtLoader,
 }
+
+
+# cl100k_base is the tokenizer used by gpt-4o-mini and text-embedding-3-small
+encoding = tiktoken.get_encoding("cl100k_base")
+
+
+def count_tokens(text: str) -> int:
+    return len(encoding.encode(text))
+
+
+PARENT_CHUNK_SIZE = 2000  # large chunk given to the LLM
+PARENT_CHUNK_OVERLAP = 200
+CHILD_CHUNK_SIZE = 500  # small chunk used for retrieval — same as before
+CHILD_CHUNK_OVERLAP = 100
+
+
+async def load_and_chunk_file_parent_child(file_path: str, source_filename: str):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in LOADER_MAPPING:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+    # CPU-bound parsing/splitting — offload to thread pool
+    def parse_and_split():
+        loader = LOADER_MAPPING[ext](file_path)
+        pages = loader.load()
+        parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=PARENT_CHUNK_SIZE,
+            chunk_overlap=PARENT_CHUNK_OVERLAP,
+            separators=["\n\n", "\n", " ", ""],
+        )
+        return parent_splitter.split_documents(pages)
+
+    parent_chunks = await asyncio.get_event_loop().run_in_executor(
+        None, parse_and_split
+    )
+
+    # Async DB inserts — genuinely async, run directly with await
+    parent_records = []
+    async with get_db_conn() as conn:
+        for parent in parent_chunks:
+            row = await conn.execute(
+                "INSERT INTO parent_documents (parent_text, source_filename, page) VALUES (%s, %s, %s) RETURNING parent_id",
+                (parent.page_content, source_filename, parent.metadata.get("page", 0)),
+            )
+            parent_id = (await row.fetchone())[0]
+            parent_records.append((str(parent_id), parent))
+
+    # CPU-bound child splitting — offload again
+    def split_children():
+        child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHILD_CHUNK_SIZE,
+            chunk_overlap=CHILD_CHUNK_OVERLAP,
+            separators=["\n\n", "\n", " ", ""],
+        )
+        all_children = []
+        for parent_id, parent_doc in parent_records:
+            children = child_splitter.split_documents([parent_doc])
+            for child in children:
+                child.metadata["source_filename"] = source_filename
+                child.metadata["parent_id"] = parent_id
+            all_children.extend(children)
+        return all_children
+
+    return await asyncio.get_event_loop().run_in_executor(None, split_children)
 
 
 def load_and_chunk_file(file_path: str, source_filename: str):
@@ -146,9 +213,7 @@ async def ingest_file(job_id: str, file_path: str, filename: str):
         # Phase B: Parse and chunk document structures
         # run_in_executor offloads the heavy CPU block away from FastAPI's primary thread
         print(f"[Worker] Dispatching PyPDFLoader tokenization loop to thread pool...")
-        chunks = await asyncio.get_event_loop().run_in_executor(
-            None, load_and_chunk_file, file_path, filename
-        )
+        chunks = await load_and_chunk_file_parent_child(file_path, filename)
 
         # Phase C: Embed vectors and upsert to pgvector table space
         # get_vectorstore relies on synchronous networking under the hood; wrap it!
