@@ -34,6 +34,7 @@ class SourceChunk(BaseModel):
     source: str  # filename the chunk came from
     page: int
     content_preview: str  # first 200 chars of chunk text
+    matched_snippet: str
     rerank_score: float
     original_rank: int  # pgvector rank before reranking
 

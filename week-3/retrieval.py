@@ -194,11 +194,14 @@ async def resolve_parents(child_candidates: list[dict]) -> list[dict]:
             resolved.append(
                 {
                     **c,
+                    "child_text": c["text"],  # preserve the original matched snippet
                     "text": parent_lookup[parent_id],  # swap child text for parent text
                 }
             )
         else:
-            resolved.append(c)  # no parent found — keep child text
+            resolved.append(
+                {**c, "child_text": c["text"]}
+            )  # no parent found — keep child text
 
     return resolved
 

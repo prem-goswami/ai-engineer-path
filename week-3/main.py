@@ -22,6 +22,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
+from fastapi.middleware.cors import CORSMiddleware
+
 
 from config import (
     UPLOAD_DIR,
@@ -81,6 +83,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── LLM + Prompt (module level — loaded once) ─────────────
 llm = ChatOpenAI(
@@ -284,6 +292,7 @@ async def query(request: QueryRequest):
             source=c["metadata"].get("source_filename", "unknown"),
             page=c["metadata"].get("page", 0),
             content_preview=c["text"][:200],
+            matched_snippet=c.get("child_text", c["text"])[:200],
             rerank_score=c.get("rerank_score", 0.0),
             original_rank=c.get("original_rank", 0),
         )
@@ -312,7 +321,8 @@ async def query_stream(request: QueryRequest):
             chunk_id=str(c["chunk_id"]),
             source=c["metadata"].get("source_filename", "unknown"),
             page=c["metadata"].get("page", 0),
-            content_preview=c["text"][:200],
+            content_preview=c["text"][:500],
+            matched_snippet=c.get("child_text", c["text"])[:200],
             rerank_score=c.get("rerank_score", 0.0),
             original_rank=c.get("original_rank", 0),
         )
