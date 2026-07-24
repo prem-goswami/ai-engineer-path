@@ -221,3 +221,14 @@ async def log_query_cost(
                 total_cost,
             ),
         )
+
+        # Prune the table to strictly 10 rows
+        await conn.execute("""
+            DELETE FROM query_costs 
+            WHERE query_id NOT IN (
+                SELECT query_id 
+                FROM query_costs 
+                ORDER BY created_at DESC 
+                LIMIT 10
+            );
+            """)
